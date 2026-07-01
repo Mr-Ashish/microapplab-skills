@@ -1,0 +1,13 @@
+{
+  "name": "hashnode-mcp-server",
+  "version": "1.0.0",
+  "description": "MCP server for Hashnode blog publishing — create drafts, publish posts, manage tags.",
+  "type": "module",
+  "main": "src/server.mjs",
+  "scripts": {
+    "start": "node src/server.mjs"
+  },
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.12.1"
+  }
+}

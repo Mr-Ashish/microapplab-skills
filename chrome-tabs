@@ -1,0 +1,742 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+VERSION="2.0.0"
+
+# --- Usage ---
+usage() {
+  cat <<EOF
+chrome-tabs v${VERSION} — List, search, and deep-search Google Chrome tabs
+
+Usage:
+  chrome-tabs [OPTIONS]                        List open tabs
+  chrome-tabs search "QUERY" [OPTIONS]         Search, rank, and open results
+  chrome-tabs deepsearch "QUERY" [OPTIONS]     Recursive grouped search tree
+
+List options:
+  -f, --format FORMAT   Output format: table (default), json, csv, tsv
+  -s, --sort FIELD      Sort by: index (default), title, url
+  -r, --reverse         Reverse sort order
+  -w, --window NUM      Show only tabs from window NUM (1-based)
+  -n, --no-header       Suppress header row (table/csv/tsv)
+
+Search options:
+  -n, --num NUM         Number of results to open (default: 10)
+  -S, --source SOURCE   Search source: web (default), github
+  --dry-run             Show results without opening Chrome
+
+Deep search options:
+  -n, --num NUM         Results per wave (default: 10)
+  -d, --depth NUM       Recursion depth 1-3 (default: 2)
+  -g, --groups NUM      Max groups to form (default: 4)
+  -S, --source SOURCE   Search source: web (default), github
+  --dry-run             Show tree without opening Chrome
+
+Common:
+  -h, --help            Show this help
+  -v, --version         Show version
+
+Examples:
+  chrome-tabs                                    # table of all tabs
+  chrome-tabs search "agent architectures"       # flat search, open top 10
+  chrome-tabs deepsearch "agent architectures"   # recursive grouped search
+  chrome-tabs deepsearch "LLM agents" -d 3 -g 5  # deeper, more groups
+  chrome-tabs deepsearch "rust async" --dry-run   # preview tree only
+  chrome-tabs search "LLM framework" -S github    # search GitHub repos
+  chrome-tabs deepsearch "agent" -S github         # deep search GitHub
+EOF
+  exit 0
+}
+
+# =====================================================
+# DEEPSEARCH subcommand — recursive grouped search tree
+# =====================================================
+if [[ "${1:-}" == "deepsearch" ]]; then
+  shift
+  if [[ $# -eq 0 ]]; then
+    echo "Usage: chrome-tabs deepsearch \"QUERY\" [-n NUM] [-d DEPTH] [-g GROUPS] [--dry-run]" >&2
+    exit 1
+  fi
+
+  QUERY="$1"; shift
+  NUM_RESULTS=10
+  DEPTH=2
+  MAX_GROUPS=4
+  DRY_RUN=false
+  SOURCE=web
+
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      -n|--num)     NUM_RESULTS="$2"; shift 2 ;;
+      -d|--depth)   DEPTH="$2"; shift 2 ;;
+      -g|--groups)  MAX_GROUPS="$2"; shift 2 ;;
+      -S|--source)  SOURCE="$2"; shift 2 ;;
+      --dry-run)    DRY_RUN=true; shift ;;
+      -h|--help)    usage ;;
+      *) echo "Unknown deepsearch option: $1" >&2; exit 1 ;;
+    esac
+  done
+
+  if [[ "$DEPTH" -lt 1 || "$DEPTH" -gt 3 ]]; then
+    echo "Error: depth must be 1-3" >&2; exit 1
+  fi
+  if [[ "$SOURCE" != "web" && "$SOURCE" != "github" ]]; then
+    echo "Error: source must be 'web' or 'github'" >&2; exit 1
+  fi
+
+  echo "Deep search: \"${QUERY}\"  (source=${SOURCE}, depth=${DEPTH}, groups=${MAX_GROUPS}, results/wave=${NUM_RESULTS})"
+  echo ""
+
+  # --- Full recursive search engine in Python ---
+  TREE_JSON=$(python3 - "$QUERY" "$NUM_RESULTS" "$MAX_GROUPS" "$DEPTH" "$SOURCE" <<'PYEOF'
+import urllib.request, urllib.parse, re, html as htmlmod, sys, json, time
+from collections import Counter
+
+STOP_WORDS = {
+    'the','a','an','in','on','at','to','for','of','and','or','is','it','by','with',
+    'from','as','that','this','how','what','which','who','why','where','when',
+    'are','was','were','be','been','being','have','has','had','do','does','did',
+    'will','would','could','should','may','might','can','shall','not','no','nor',
+    'but','if','then','else','so','up','out','about','into','over','after','before',
+    'between','under','above','below','all','each','every','both','few','more',
+    'most','other','some','such','than','too','very','just','also','only','own',
+    'same','your','our','their','its','my','his','her','we','they','you','me',
+    'him','us','them','she','he','top','best','guide','complete','full',
+    'new','vs','using','use','used','based','get','set','make','take','like',
+    'one','two','three','first','second','2024','2025','2026','pdf','introduction',
+    'overview','everything','need','know','learn','tutorial','blog','post',
+    'article','review','list','way','ways','things','part','series','free',
+    'online','web','site','page','home','search','result','results','google',
+}
+
+def search_ddg(query, limit=10):
+    """Search DuckDuckGo HTML and return list of {title, url}."""
+    url = "https://html.duckduckgo.com/html/?q=" + urllib.parse.quote_plus(query)
+    req = urllib.request.Request(url, headers={
+        "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7)"
+    })
+    try:
+        data = urllib.request.urlopen(req, timeout=15).read().decode("utf-8", errors="replace")
+    except Exception:
+        return []
+    pattern = r'class="result__a"\s+href="[^"]*uddg=([^&"]+)[^"]*"[^>]*>(.*?)</a>'
+    matches = re.findall(pattern, data, re.DOTALL)
+    seen = set()
+    results = []
+    for encoded_url, raw_title in matches:
+        u = urllib.parse.unquote(encoded_url)
+        if u in seen or not u.startswith("http"):
+            continue
+        seen.add(u)
+        title = re.sub(r"<[^>]+>", "", htmlmod.unescape(raw_title)).strip()
+        results.append({"title": title, "url": u})
+        if len(results) >= limit:
+            break
+    return results
+
+def search_github(query, limit=10):
+    """Search GitHub repositories API and return list of {title, url, stars, language}."""
+    url = "https://api.github.com/search/repositories?" + urllib.parse.urlencode({
+        "q": query, "sort": "stars", "order": "desc", "per_page": str(limit)
+    })
+    req = urllib.request.Request(url, headers={
+        "User-Agent": "chrome-tabs-cli/2.0",
+        "Accept": "application/vnd.github.v3+json",
+    })
+    try:
+        data = urllib.request.urlopen(req, timeout=15).read().decode("utf-8")
+    except Exception as e:
+        print(f"GitHub API error: {e}", file=sys.stderr)
+        return []
+    resp = json.loads(data)
+    results = []
+    for item in resp.get("items", []):
+        stars = item.get("stargazers_count", 0)
+        lang = item.get("language") or "—"
+        name = item.get("full_name", "")
+        desc = item.get("description") or ""
+        if len(desc) > 80:
+            desc = desc[:77] + "..."
+        if stars >= 1000:
+            star_str = f"{stars/1000:.1f}k"
+        else:
+            star_str = str(stars)
+        title = f"{name}  [{star_str} stars, {lang}]"
+        results.append({
+            "title": title,
+            "url": item.get("html_url", ""),
+            "stars": stars,
+            "language": lang,
+            "name": name,
+            "description": desc,
+        })
+    return results
+
+def do_search(query, limit, source):
+    if source == "github":
+        return search_github(query, limit)
+    return search_ddg(query, limit)
+
+def extract_keywords(results, exclude_words, top_n=5):
+    """Extract dominant topic keywords from result titles."""
+    word_counter = Counter()
+    for r in results:
+        text = r['title'].lower()
+        if r.get('description'):
+            text += " " + r['description'].lower()
+        words = set(re.findall(r'[a-z]{3,}', text))
+        for w in words:
+            if w not in STOP_WORDS and w not in exclude_words:
+                word_counter[w] += 1
+    keywords = [w for w, c in word_counter.most_common(top_n * 2) if c >= 2]
+    return keywords[:top_n] if keywords else [w for w, _ in word_counter.most_common(top_n)]
+
+def extract_languages(results, top_n=5):
+    """Extract top languages from GitHub results for grouping."""
+    lang_counter = Counter()
+    for r in results:
+        lang = r.get("language", "—")
+        if lang and lang != "—":
+            lang_counter[lang] += 1
+    return [lang for lang, _ in lang_counter.most_common(top_n) if lang_counter[lang] >= 1]
+
+def cluster_results(results, keywords):
+    """Assign each result to its best-matching keyword group."""
+    groups = {k: [] for k in keywords}
+    groups["other"] = []
+    assigned_urls = set()
+    for r in results:
+        t = r['title'].lower()
+        if r.get('description'):
+            t += " " + r['description'].lower()
+        matched = False
+        for kw in keywords:
+            if kw.lower() in t and r['url'] not in assigned_urls:
+                groups[kw].append(r)
+                assigned_urls.add(r['url'])
+                matched = True
+                break
+        if not matched:
+            groups["other"].append(r)
+    return {k: v for k, v in groups.items() if v}
+
+def recursive_search(query, limit, max_groups, depth, global_seen, query_words, source, current_depth=1):
+    """Build the search tree recursively."""
+    indent = "  " * (current_depth - 1)
+    print(f"{indent}[depth {current_depth}] Searching: \"{query}\"", file=sys.stderr)
+
+    results = do_search(query, limit, source)
+    new_results = []
+    for r in results:
+        if r['url'] not in global_seen:
+            global_seen.add(r['url'])
+            new_results.append(r)
+
+    if not new_results:
+        return {"query": query, "depth": current_depth, "results": [], "children": []}
+
+    node = {
+        "query": query,
+        "depth": current_depth,
+        "results": new_results,
+        "children": []
+    }
+
+    if current_depth >= depth:
+        return node
+
+    # --- Grouping strategy differs by source ---
+    if source == "github":
+        # Group by programming language
+        languages = extract_languages(new_results, max_groups)
+        if not languages:
+            return node
+        groups = cluster_results(new_results, languages)
+        group_keys = languages
+    else:
+        # Group by keyword from titles
+        all_query_words = query_words | set(re.findall(r'[a-z]{3,}', query.lower()))
+        keywords = extract_keywords(new_results, all_query_words, max_groups)
+        if not keywords:
+            return node
+        groups = cluster_results(new_results, keywords)
+        group_keys = keywords
+
+    for kw, group_results in groups.items():
+        if kw == "other":
+            node["children"].append({
+                "query": f"{query} (ungrouped)",
+                "keyword": "other",
+                "depth": current_depth + 1,
+                "results": group_results,
+                "children": []
+            })
+            continue
+
+        # Build sub-query based on source
+        if source == "github":
+            sub_query = f"{query} language:{kw}"
+        else:
+            sub_query = f"{query} {kw}"
+
+        time.sleep(1.0 if source == "github" else 0.5)
+        child = recursive_search(
+            sub_query, limit, max(2, max_groups - 1),
+            depth, global_seen, query_words, source, current_depth + 1
+        )
+        child["keyword"] = kw
+        child["wave1_hits"] = group_results
+        node["children"].append(child)
+
+    return node
+
+# --- Main ---
+query = sys.argv[1]
+limit = int(sys.argv[2])
+max_groups = int(sys.argv[3])
+depth = int(sys.argv[4])
+source = sys.argv[5]
+
+query_words = set(re.findall(r'[a-z]{3,}', query.lower()))
+global_seen = set()
+
+tree = recursive_search(query, limit, max_groups, depth, global_seen, query_words, source)
+tree["source"] = source
+print(json.dumps(tree))
+PYEOF
+  )
+
+  if [[ $? -ne 0 || -z "$TREE_JSON" ]]; then
+    echo "Deep search failed." >&2
+    exit 1
+  fi
+
+  # --- Render tree and open Chrome windows via Python ---
+  python3 - "$TREE_JSON" "$DRY_RUN" <<'RENDER_PY'
+import json, sys, subprocess
+
+tree = json.loads(sys.argv[1])
+dry_run = sys.argv[2] == "true"
+source = tree.get("source", "web")
+is_gh = source == "github"
+
+BLUE = "\033[1;34m"
+CYAN = "\033[0;36m"
+GREEN = "\033[0;32m"
+YELLOW = "\033[0;33m"
+DIM = "\033[2m"
+BOLD = "\033[1m"
+RESET = "\033[0m"
+
+windows = []
+
+def fmt_result(r, bullet="•"):
+    """Format a single result line, with GitHub metadata if present."""
+    name = r.get("name", "")
+    desc = r.get("description", "")
+    title = r.get("title", "")
+    url = r.get("url", "")
+    lines = []
+    if name:
+        # GitHub result
+        stars = r.get("stars", 0)
+        lang = r.get("language", "—")
+        star_str = f"{stars/1000:.1f}k" if stars >= 1000 else str(stars)
+        display = name if len(name) <= 45 else name[:42] + "..."
+        lines.append(f"{GREEN}{bullet} {display}  {YELLOW}★ {star_str}  {CYAN}{lang}{RESET}")
+        if desc:
+            d = desc[:65] + "..." if len(desc) > 65 else desc
+            lines.append(f"    {DIM}{d}{RESET}")
+        lines.append(f"    {DIM}{url}{RESET}")
+    else:
+        t = title[:55] + "..." if len(title) > 55 else title
+        lines.append(f"{GREEN}{bullet} {t}{RESET}")
+        lines.append(f"    {DIM}{url}{RESET}")
+    return lines
+
+def print_tree(node, prefix="", is_last=True):
+    connector = "└── " if is_last else "├── "
+    kw = node.get("keyword", "")
+    depth = node.get("depth", 1)
+    query = node.get("query", "")
+
+    src_label = " [GitHub]" if is_gh else ""
+    if depth == 1:
+        print(f"{BOLD}{BLUE}{'='*70}{RESET}")
+        print(f"{BOLD}{BLUE}  Deep Search: \"{query}\"{src_label}{RESET}")
+        print(f"{BOLD}{BLUE}{'='*70}{RESET}")
+    else:
+        label = kw.upper() if kw and kw != "other" else "OTHER"
+        print(f"{prefix}{connector}{BOLD}{CYAN}[{label}]{RESET} {DIM}query: \"{query}\"{RESET}")
+
+    results = node.get("results", [])
+    wave1_hits = node.get("wave1_hits", [])
+    group_urls = []
+
+    if depth == 1 and not node.get("children"):
+        for i, r in enumerate(results, 1):
+            for line in fmt_result(r, f"{i:>3}."):
+                print(f"  {line}")
+            group_urls.append((r.get("title",""), r["url"]))
+
+    if wave1_hits:
+        child_prefix = prefix + ("    " if is_last else "│   ")
+        print(f"{child_prefix}{DIM}Wave 1 matches:{RESET}")
+        for r in wave1_hits:
+            for line in fmt_result(r):
+                print(f"{child_prefix}  {line}")
+            group_urls.append((r.get("title",""), r["url"]))
+
+    if results and depth > 1:
+        child_prefix = prefix + ("    " if is_last else "│   ")
+        print(f"{child_prefix}{DIM}Wave {depth} results:{RESET}")
+        for r in results:
+            for line in fmt_result(r, "▸"):
+                print(f"{child_prefix}  {line}")
+            group_urls.append((r.get("title",""), r["url"]))
+
+    if depth == 2 and group_urls:
+        label = kw.upper() if kw and kw != "other" else "OTHER"
+        windows.append({"label": label, "urls": group_urls})
+
+    children = node.get("children", [])
+    for i, child in enumerate(children):
+        is_child_last = (i == len(children) - 1)
+        child_prefix = prefix + ("    " if is_last else "│   ") if depth > 1 else ""
+        print_tree(child, child_prefix, is_child_last)
+
+        if child.get("depth", 0) > 2:
+            deep_urls = [(r.get("title",""), r["url"]) for r in child.get("results", [])]
+            if deep_urls:
+                parent_kw = node.get("keyword", "other").upper()
+                for w in windows:
+                    if w["label"] == parent_kw:
+                        w["urls"].extend(deep_urls)
+                        break
+
+print_tree(tree)
+
+total_urls = sum(len(w["urls"]) for w in windows)
+print()
+print(f"{BOLD}{'='*70}{RESET}")
+print(f"{BOLD}  {len(windows)} group(s), {total_urls} total URL(s)  {DIM}[source: {source}]{RESET}")
+for w in windows:
+    print(f"    {CYAN}[{w['label']}]{RESET} — {len(w['urls'])} tab(s)")
+print(f"{BOLD}{'='*70}{RESET}")
+
+if dry_run:
+    print(f"\n{DIM}(dry run — not opening Chrome){RESET}")
+    sys.exit(0)
+
+if not windows:
+    print("No results to open.")
+    sys.exit(0)
+
+for w in windows:
+    seen = set()
+    unique = []
+    for title, url in w["urls"]:
+        if url not in seen:
+            seen.add(url)
+            unique.append((title, url))
+
+    lines = ['tell application "Google Chrome"']
+    for i, (title, url) in enumerate(unique):
+        escaped = url.replace('"', '\\"')
+        if i == 0:
+            lines.append('  make new window')
+            lines.append(f'  set URL of active tab of front window to "{escaped}"')
+        else:
+            lines.append(f'  tell front window to make new tab with properties {{URL:"{escaped}"}}')
+    lines.append('  activate')
+    lines.append('end tell')
+    script = "\n".join(lines)
+    subprocess.run(["osascript", "-e", script], check=True)
+
+print(f"\nOpened {len(windows)} Chrome window(s).")
+RENDER_PY
+
+  exit 0
+fi
+
+# =====================================================
+# SEARCH subcommand — flat search
+# =====================================================
+if [[ "${1:-}" == "search" ]]; then
+  shift
+  if [[ $# -eq 0 ]]; then
+    echo "Usage: chrome-tabs search \"QUERY\" [-n NUM] [--dry-run]" >&2
+    exit 1
+  fi
+
+  QUERY="$1"; shift
+  NUM_RESULTS=10
+  DRY_RUN=false
+  SOURCE=web
+
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      -n|--num)     NUM_RESULTS="$2"; shift 2 ;;
+      -S|--source)  SOURCE="$2"; shift 2 ;;
+      --dry-run)    DRY_RUN=true; shift ;;
+      -h|--help)    usage ;;
+      *) echo "Unknown search option: $1" >&2; exit 1 ;;
+    esac
+  done
+
+  if [[ "$SOURCE" != "web" && "$SOURCE" != "github" ]]; then
+    echo "Error: source must be 'web' or 'github'" >&2; exit 1
+  fi
+
+  SRC_LABEL=""
+  [[ "$SOURCE" == "github" ]] && SRC_LABEL=" [GitHub]"
+  echo "Searching: \"${QUERY}\" (top ${NUM_RESULTS} results)${SRC_LABEL}..."
+  echo ""
+
+  # --- Fetch and parse results via python3 ---
+  RESULTS=$(python3 - "$QUERY" "$NUM_RESULTS" "$SOURCE" <<'PYEOF'
+import urllib.request, urllib.parse, re, html as htmlmod, sys, json
+
+query = sys.argv[1]
+limit = int(sys.argv[2])
+source = sys.argv[3]
+
+if source == "github":
+    url = "https://api.github.com/search/repositories?" + urllib.parse.urlencode({
+        "q": query, "sort": "stars", "order": "desc", "per_page": str(limit)
+    })
+    req = urllib.request.Request(url, headers={
+        "User-Agent": "chrome-tabs-cli/2.0",
+        "Accept": "application/vnd.github.v3+json",
+    })
+    try:
+        data = urllib.request.urlopen(req, timeout=15).read().decode("utf-8")
+    except Exception as e:
+        print(f"GitHub API error: {e}", file=sys.stderr)
+        sys.exit(1)
+    resp = json.loads(data)
+    rank = 0
+    for item in resp.get("items", []):
+        rank += 1
+        stars = item.get("stargazers_count", 0)
+        lang = item.get("language") or "—"
+        name = item.get("full_name", "")
+        desc = (item.get("description") or "")[:80]
+        star_str = f"{stars/1000:.1f}k" if stars >= 1000 else str(stars)
+        title = f"{name}  [★{star_str}, {lang}]"
+        gh_url = item.get("html_url", "")
+        # tab-separated: rank, title, url, description
+        print(f"{rank}\t{title}\t{gh_url}\t{desc}")
+    if rank == 0:
+        print("NO_RESULTS", file=sys.stderr)
+        sys.exit(1)
+else:
+    url = "https://html.duckduckgo.com/html/?q=" + urllib.parse.quote_plus(query)
+    req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7)"})
+    data = urllib.request.urlopen(req, timeout=15).read().decode("utf-8", errors="replace")
+    pattern = r'class="result__a"\s+href="[^"]*uddg=([^&"]+)[^"]*"[^>]*>(.*?)</a>'
+    matches = re.findall(pattern, data, re.DOTALL)
+    seen = set()
+    rank = 0
+    for encoded_url, raw_title in matches:
+        u = urllib.parse.unquote(encoded_url)
+        if u in seen or not u.startswith("http"):
+            continue
+        seen.add(u)
+        rank += 1
+        title = re.sub(r"<[^>]+>", "", htmlmod.unescape(raw_title)).strip()
+        print(f"{rank}\t{title}\t{u}\t")
+        if rank >= limit:
+            break
+    if rank == 0:
+        print("NO_RESULTS", file=sys.stderr)
+        sys.exit(1)
+PYEOF
+  )
+
+  if [[ $? -ne 0 || -z "$RESULTS" ]]; then
+    echo "No results found for \"${QUERY}\"." >&2
+    exit 1
+  fi
+
+  # --- Display ranked results ---
+  printf "%-4s %-55s %s\n" "#" "Title" "URL"
+  printf "%-4s %-55s %s\n" "---" "$(printf '%0.s-' {1..55})" "$(printf '%0.s-' {1..50})"
+  echo "$RESULTS" | while IFS=$'\t' read -r rank title url desc; do
+    if [[ ${#title} -gt 53 ]]; then
+      title="${title:0:50}..."
+    fi
+    printf "%-4s %-55s %s\n" "$rank" "$title" "$url"
+    if [[ -n "$desc" && "$SOURCE" == "github" ]]; then
+      printf "%-4s %-55s\n" "" "  $desc"
+    fi
+  done
+  echo ""
+
+  if $DRY_RUN; then
+    echo "(dry run — not opening Chrome)"
+    exit 0
+  fi
+
+  # --- Build AppleScript to open all URLs in a new window ---
+  ASCRIPT='tell application "Google Chrome"
+'
+  FIRST=true
+  while IFS=$'\t' read -r rank title url desc; do
+    if $FIRST; then
+      ASCRIPT+="  make new window
+  set URL of active tab of front window to \"${url}\"
+"
+      FIRST=false
+    else
+      ASCRIPT+="  tell front window to make new tab with properties {URL:\"${url}\"}
+"
+    fi
+  done <<< "$RESULTS"
+  ASCRIPT+='  activate
+end tell'
+
+  osascript -e "$ASCRIPT"
+
+  TOTAL=$(echo "$RESULTS" | grep -c .)
+  echo "Opened ${TOTAL} tab(s) in a new Chrome window."
+  exit 0
+fi
+
+# =====================================================
+# LIST subcommand (default)
+# =====================================================
+
+# --- Defaults ---
+FORMAT="table"
+SORT="index"
+REVERSE=false
+WINDOW_FILTER=""
+NO_HEADER=false
+
+# --- Parse args ---
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    -f|--format)  FORMAT="$2"; shift 2 ;;
+    -s|--sort)    SORT="$2"; shift 2 ;;
+    -r|--reverse) REVERSE=true; shift ;;
+    -w|--window)  WINDOW_FILTER="$2"; shift 2 ;;
+    -n|--no-header) NO_HEADER=true; shift ;;
+    -h|--help)    usage ;;
+    -v|--version) echo "chrome-tabs v${VERSION}"; exit 0 ;;
+    *) echo "Unknown option: $1" >&2; usage ;;
+  esac
+done
+
+# --- Check Chrome is running ---
+if ! pgrep -x "Google Chrome" > /dev/null 2>&1; then
+  echo "Error: Google Chrome is not running." >&2
+  exit 1
+fi
+
+# --- Collect tabs via osascript ---
+TAB_DATA=$(osascript <<'APPLESCRIPT'
+set output to ""
+tell application "Google Chrome"
+    set winCount to count of windows
+    repeat with w from 1 to winCount
+        set tabCount to count of tabs of window w
+        repeat with t from 1 to tabCount
+            set tabTitle to title of tab t of window w
+            set tabURL to URL of tab t of window w
+            set output to output & w & "	" & t & "	" & tabTitle & "	" & tabURL & linefeed
+        end repeat
+    end repeat
+end tell
+return output
+APPLESCRIPT
+)
+
+if [[ -z "$TAB_DATA" ]]; then
+  echo "No tabs found." >&2
+  exit 0
+fi
+
+# --- Filter by window if requested ---
+if [[ -n "$WINDOW_FILTER" ]]; then
+  TAB_DATA=$(echo "$TAB_DATA" | awk -F'\t' -v w="$WINDOW_FILTER" '$1 == w')
+  if [[ -z "$TAB_DATA" ]]; then
+    echo "No tabs found in window ${WINDOW_FILTER}." >&2
+    exit 0
+  fi
+fi
+
+# --- Sort ---
+case "$SORT" in
+  index) SORT_KEY="-k1,1n -k2,2n" ;;
+  title) SORT_KEY="-k3,3f" ;;
+  url)   SORT_KEY="-k4,4f" ;;
+  *)     echo "Unknown sort field: $SORT (use: index, title, url)" >&2; exit 1 ;;
+esac
+
+if $REVERSE; then
+  SORTED=$(echo "$TAB_DATA" | sort -t$'\t' $SORT_KEY -r)
+else
+  SORTED=$(echo "$TAB_DATA" | sort -t$'\t' $SORT_KEY)
+fi
+
+TIMESTAMP=$(date '+%Y-%m-%d %H:%M:%S')
+
+# --- Output ---
+case "$FORMAT" in
+  table)
+    if ! $NO_HEADER; then
+      printf "%-4s %-4s %-60s %s\n" "Win" "Tab" "Title" "URL"
+      printf "%-4s %-4s %-60s %s\n" "---" "---" "$(printf '%0.s-' {1..60})" "$(printf '%0.s-' {1..40})"
+    fi
+    echo "$SORTED" | while IFS=$'\t' read -r win tab title url; do
+      # Truncate long titles for table display
+      if [[ ${#title} -gt 58 ]]; then
+        title="${title:0:55}..."
+      fi
+      printf "%-4s %-4s %-60s %s\n" "$win" "$tab" "$title" "$url"
+    done
+    if ! $NO_HEADER; then
+      TOTAL=$(echo "$SORTED" | grep -c .)
+      echo ""
+      echo "Total: ${TOTAL} tab(s) — captured at ${TIMESTAMP}"
+    fi
+    ;;
+  json)
+    echo "["
+    FIRST=true
+    echo "$SORTED" | while IFS=$'\t' read -r win tab title url; do
+      if $FIRST; then FIRST=false; else echo ","; fi
+      # Escape JSON strings
+      title=$(echo "$title" | sed 's/\\/\\\\/g; s/"/\\"/g')
+      url=$(echo "$url" | sed 's/\\/\\\\/g; s/"/\\"/g')
+      printf '  {"window": %s, "tab": %s, "title": "%s", "url": "%s", "captured_at": "%s"}' \
+        "$win" "$tab" "$title" "$url" "$TIMESTAMP"
+    done
+    echo ""
+    echo "]"
+    ;;
+  csv)
+    if ! $NO_HEADER; then
+      echo "window,tab,title,url,captured_at"
+    fi
+    echo "$SORTED" | while IFS=$'\t' read -r win tab title url; do
+      # Escape CSV fields (wrap in quotes, double internal quotes)
+      title=$(echo "$title" | sed 's/"/""/g')
+      url=$(echo "$url" | sed 's/"/""/g')
+      echo "${win},${tab},\"${title}\",\"${url}\",\"${TIMESTAMP}\""
+    done
+    ;;
+  tsv)
+    if ! $NO_HEADER; then
+      printf "window\ttab\ttitle\turl\tcaptured_at\n"
+    fi
+    echo "$SORTED" | while IFS=$'\t' read -r win tab title url; do
+      printf "%s\t%s\t%s\t%s\t%s\n" "$win" "$tab" "$title" "$url" "$TIMESTAMP"
+    done
+    ;;
+  *)
+    echo "Unknown format: $FORMAT (use: table, json, csv, tsv)" >&2
+    exit 1
+    ;;
+esac
