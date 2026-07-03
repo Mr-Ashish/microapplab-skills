@@ -75,6 +75,7 @@ conversation excerpt and metadata. Produce this exact JSON structure per convers
 {
   "title": "Short descriptive title",
   "source": "grok",
+  "project": "Blockr",
   "summary": "One paragraph describing what was done in this conversation.",
   "decisions": ["Decision 1", "Decision 2"],
   "files_changed": ["path/to/file.py", "other/file.ts"],
@@ -90,6 +91,20 @@ conversation excerpt and metadata. Produce this exact JSON structure per convers
   "duration_seconds": 1500
 }
 ```
+
+**Deriving `project`:**
+The session metadata contains a `workspace` field (the filesystem path or working directory
+where the conversation ran). Derive the `project` name from it using these rules, in order:
+
+1. If the workspace path contains a recognizable project/repo folder name, use it
+   (e.g., `/Users/alice/Documents/personal/Blockr/Blockr-latest` → `Blockr`).
+2. Otherwise, use the last meaningful directory segment of the workspace path
+   (e.g., `/Users/alice/projects/my-saas-app` → `my-saas-app`).
+3. If the workspace is an opaque identifier (e.g., `cursor-workspace:abc123`), set
+   project to `"unknown"`.
+4. Normalize the name: capitalize the first letter, keep hyphens/camelCase as-is.
+   Strip suffixes like `-latest`, `-main`, `-dev` if a cleaner name exists upstream
+   in the path.
 
 **Summarization guidelines:**
 - Keep summaries to 2-3 sentences. Focus on what was accomplished, not process.
@@ -109,6 +124,7 @@ Assemble all conversation summaries into a single digest JSON:
 ```json
 {
   "date": "2026-07-01",
+  "projects": ["Blockr", "skills"],
   "conversations": [ ...array of conversation summaries from Step 4... ],
   "work_items": {
     "done": [ ...merged from all conversations... ],
@@ -118,6 +134,9 @@ Assemble all conversation summaries into a single digest JSON:
   }
 }
 ```
+
+The `projects` array is the de-duplicated, sorted list of all unique `project` values
+from the conversation summaries.
 
 Write this to `/tmp/daily-digest-final.json`.
 
@@ -131,8 +150,8 @@ python3 ~/.grok/skills/daily-digest/scripts/notion_sync.py --input /tmp/daily-di
 
 The script:
 - Checks if a page for this date already exists (idempotent — updates, not duplicates)
-- Creates/updates the database row with properties (Date, Conversations count, Done/Pending/In Progress counts, Sources used)
-- Populates the page body with Work Items section and Conversations section
+- Creates/updates the database row with properties (Date, Conversations count, Done/Pending/In Progress counts, Sources used, Projects)
+- Populates the page body in a **project-first layout**: each project gets its own section with aggregated work items (done/in-progress/pending/priority) and conversation details nested underneath
 
 ### Step 7: Report Results
 
@@ -146,10 +165,16 @@ Example output:
 ```
 ✅ Daily digest synced for 2026-07-01
 
+📁 Projects: Blockr, skills
+
 📊 7 conversations collected:
    • Grok: 4 sessions
    • Claude Code: 2 sessions
    • Cursor: 1 session
+
+💬 By project:
+   • Blockr: 5 sessions
+   • skills: 2 sessions
 
 📋 Work items:
    • ✅ Done: 5 items

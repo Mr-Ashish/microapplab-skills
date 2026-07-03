@@ -61,6 +61,24 @@ def get_database_id() -> str:
     return db_id
 
 
+def _ensure_projects_property(client: "Client", db_id: str) -> None:
+    """Auto-create the Projects multi_select property if it doesn't exist."""
+    try:
+        ds_id = _resolve_data_source_id(client, db_id)
+        ds = client.data_sources.retrieve(ds_id)
+        props = ds.get("properties", {})
+        if "Projects" not in props:
+            client.data_sources.update(
+                data_source_id=ds_id,
+                properties={"Projects": {"multi_select": {"options": []}}},
+            )
+            print("Auto-created 'Projects' property in Notion database.",
+                  file=sys.stderr)
+    except Exception as e:
+        print(f"Warning: could not ensure Projects property: {e}",
+              file=sys.stderr)
+
+
 def _resolve_data_source_id(client: Client, db_id: str) -> str:
     """Resolve the data_source_id from a database_id (notion-client v3+)."""
     db = client.databases.retrieve(db_id)
@@ -98,10 +116,14 @@ def build_page_properties(digest: dict) -> dict:
     work_items = digest.get("work_items", {})
 
     sources_used = set()
+    projects_used = set()
     for conv in conversations:
         sources_used.add(conv.get("source", "unknown"))
+        project = conv.get("project", "")
+        if project and project != "unknown":
+            projects_used.add(project)
 
-    return {
+    props = {
         "Date": {"title": [{"text": {"content": date_title}}]},
         "Day": {"date": {"start": target_date}},
         "Conversations": {
@@ -118,91 +140,146 @@ def build_page_properties(digest: dict) -> dict:
         "Status": {"select": {"name": "synced"}},
     }
 
+    if projects_used:
+        props["Projects"] = {
+            "multi_select": [{"name": p} for p in sorted(projects_used)]
+        }
+
+    return props
+
 
 def build_page_body(digest: dict) -> list[dict]:
-    """Build Notion block children (page body) from digest data."""
+    """Build Notion block children (page body) from digest data.
+
+    Structure: project-first layout. Each project gets its own section with
+    aggregated work items and conversation details nested underneath.
+    """
     blocks: list[dict] = []
-    work_items = digest.get("work_items", {})
     conversations = digest.get("conversations", [])
 
-    # ---- Work Items Section ----
-    blocks.append(_heading2("📋 Work Items"))
+    # ---- Group conversations by project ----
+    from collections import OrderedDict
 
-    # Done
-    done_items = work_items.get("done", [])
-    if done_items:
-        blocks.append(_heading3("✅ Done"))
-        for item in done_items:
-            blocks.append(_bullet(item))
-    else:
-        blocks.append(_heading3("✅ Done"))
-        blocks.append(_bullet("No completed items recorded"))
+    project_groups: OrderedDict[str, list[dict]] = OrderedDict()
+    for conv in conversations:
+        project = conv.get("project", "unknown")
+        if project not in project_groups:
+            project_groups[project] = []
+        project_groups[project].append(conv)
 
-    # In Progress
-    in_progress_items = work_items.get("in_progress", [])
-    if in_progress_items:
-        blocks.append(_heading3("🔄 In Progress"))
-        for item in in_progress_items:
-            blocks.append(_bullet(item))
+    # ---- Day-level summary line ----
+    total_done = len(digest.get("work_items", {}).get("done", []))
+    total_ip = len(digest.get("work_items", {}).get("in_progress", []))
+    total_pending = len(digest.get("work_items", {}).get("pending", []))
+    total_priority = len(digest.get("work_items", {}).get("priority", []))
+    summary_parts = [
+        f"{len(conversations)} conversations",
+        f"{len(project_groups)} projects",
+    ]
+    counts = []
+    if total_done:
+        counts.append(f"✅ {total_done} done")
+    if total_ip:
+        counts.append(f"🔄 {total_ip} in progress")
+    if total_pending:
+        counts.append(f"⏳ {total_pending} pending")
+    if total_priority:
+        counts.append(f"🔥 {total_priority} priority")
+    if counts:
+        summary_parts.append(" · ".join(counts))
 
-    # Pending
-    pending_items = work_items.get("pending", [])
-    if pending_items:
-        blocks.append(_heading3("⏳ Pending"))
-        for item in pending_items:
-            blocks.append(_bullet(item))
-
-    # Priority
-    priority_items = work_items.get("priority", [])
-    if priority_items:
-        blocks.append(_heading3("🔥 Priority"))
-        for item in priority_items:
-            blocks.append(_bullet(item))
-
+    blocks.append(_paragraph(" | ".join(summary_parts), bold=True))
     blocks.append(_divider())
 
-    # ---- Conversations Section ----
-    blocks.append(_heading2("💬 Conversations"))
+    # ---- Per-project sections ----
+    conv_counter = 0
+    for project_name, project_convs in project_groups.items():
+        # Aggregate work items for this project
+        p_done: list[str] = []
+        p_in_progress: list[str] = []
+        p_pending: list[str] = []
+        p_priority: list[str] = []
+        for conv in project_convs:
+            wi = conv.get("work_items", {})
+            p_done.extend(wi.get("done", []))
+            p_in_progress.extend(wi.get("in_progress", []))
+            p_pending.extend(wi.get("pending", []))
+            p_priority.extend(wi.get("priority", []))
 
-    for i, conv in enumerate(conversations, 1):
-        title = conv.get("title", "Untitled")
-        source = conv.get("source", "unknown")
-        blocks.append(_heading3(f"{i}. {title} ({source})"))
+        # Project heading with session count
+        blocks.append(
+            _heading2(f"📁 {project_name} ({len(project_convs)} sessions)")
+        )
 
-        # Metadata line
-        meta_parts = []
-        if conv.get("duration_seconds"):
-            mins = conv["duration_seconds"] // 60
-            meta_parts.append(f"Duration: {mins} min")
-        if conv.get("message_count"):
-            meta_parts.append(f"Messages: {conv['message_count']}")
-        if conv.get("model"):
-            meta_parts.append(f"Model: {conv['model']}")
-        if conv.get("branch"):
-            meta_parts.append(f"Branch: {conv['branch']}")
+        # -- Work items for this project --
+        blocks.append(_heading3("📋 Work Items"))
 
-        if meta_parts:
-            blocks.append(_paragraph(" | ".join(meta_parts), bold=True))
+        if p_done:
+            blocks.append(_paragraph("✅ Done", bold=True))
+            for item in p_done:
+                blocks.append(_bullet(item))
 
-        # Summary
-        summary = conv.get("summary", "")
-        if summary:
-            blocks.append(_paragraph(summary))
+        if p_in_progress:
+            blocks.append(_paragraph("🔄 In Progress", bold=True))
+            for item in p_in_progress:
+                blocks.append(_bullet(item))
 
-        # Key decisions
-        decisions = conv.get("decisions", [])
-        if decisions:
-            blocks.append(_paragraph("Key Decisions:", bold=True))
-            for decision in decisions:
-                blocks.append(_bullet(decision))
+        if p_pending:
+            blocks.append(_paragraph("⏳ Pending", bold=True))
+            for item in p_pending:
+                blocks.append(_bullet(item))
 
-        # Files changed
-        files = conv.get("files_changed", [])
-        if files:
-            files_text = ", ".join(f"`{f}`" for f in files[:10])
-            if len(files) > 10:
-                files_text += f" (+{len(files) - 10} more)"
-            blocks.append(_paragraph(f"Files: {files_text}"))
+        if p_priority:
+            blocks.append(_paragraph("🔥 Priority", bold=True))
+            for item in p_priority:
+                blocks.append(_bullet(item))
+
+        if not any([p_done, p_in_progress, p_pending, p_priority]):
+            blocks.append(_bullet("No work items recorded"))
+
+        # -- Conversations for this project --
+        blocks.append(_heading3("💬 Conversations"))
+
+        for conv in project_convs:
+            conv_counter += 1
+            title = conv.get("title", "Untitled")
+            source = conv.get("source", "unknown")
+            blocks.append(_paragraph(f"{conv_counter}. {title} ({source})", bold=True))
+
+            # Metadata line
+            meta_parts = []
+            if conv.get("duration_seconds"):
+                mins = conv["duration_seconds"] // 60
+                meta_parts.append(f"Duration: {mins} min")
+            if conv.get("message_count"):
+                meta_parts.append(f"Messages: {conv['message_count']}")
+            if conv.get("model"):
+                meta_parts.append(f"Model: {conv['model']}")
+            if conv.get("branch"):
+                meta_parts.append(f"Branch: {conv['branch']}")
+
+            if meta_parts:
+                blocks.append(_paragraph(" · ".join(meta_parts)))
+
+            # Summary
+            summary = conv.get("summary", "")
+            if summary:
+                blocks.append(_paragraph(summary))
+
+            # Key decisions
+            decisions = conv.get("decisions", [])
+            if decisions:
+                blocks.append(_paragraph("Key Decisions:", bold=True))
+                for decision in decisions:
+                    blocks.append(_bullet(decision))
+
+            # Files changed
+            files = conv.get("files_changed", [])
+            if files:
+                files_text = ", ".join(f"`{f}`" for f in files[:10])
+                if len(files) > 10:
+                    files_text += f" (+{len(files) - 10} more)"
+                blocks.append(_paragraph(f"Files: {files_text}"))
 
         blocks.append(_divider())
 
@@ -227,6 +304,10 @@ def sync_to_notion(digest: dict, dry_run: bool = False) -> dict:
 
     properties = build_page_properties(digest)
     body_blocks = build_page_body(digest)
+
+    # Ensure Projects property exists in the data source schema
+    if "Projects" in properties:
+        _ensure_projects_property(client, db_id)
 
     # Check for existing page (idempotency)
     existing_page_id = find_existing_page(client, db_id, target_date)
